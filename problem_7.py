@@ -57,7 +57,100 @@ def _flash_attention_forward_swa_kernel(
     # 1. Phase 0: Sink blocks that are before the sliding window
     # 2. Phase 1: Off-Diagonal Blocks (within the window)
     # 3. Phase 2: Diagonal Blocks
-    pass
+    q_start = q_block_idx * BLOCK_M
+
+    # Phase 0: Sink blocks (those entirely in [0, SINK_SIZE)) if SINK_SIZE > 0
+    if SINK_SIZE > 0:
+        k_start = 0
+        sink_limit = SINK_SIZE
+        while k_start < sink_limit:
+            # Load K and V blocks (BLOCK_N, HEAD_DIM)
+            k_offsets = k_start + tl.arange(0, BLOCK_N)
+            kv_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                      (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+            k_block = tl.load(kv_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+            v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                      (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+            v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+            # Compute qk^T: (BLOCK_M, HEAD_DIM) @ (HEAD_DIM, BLOCK_N) -> (BLOCK_M, BLOCK_N)
+            qk = tl.dot(q_block, tl.trans(k_block)) * softmax_scale
+
+            # Apply causal + sliding-window + sink mask
+            q_abs = q_start + tl.arange(0, BLOCK_M)
+            k_abs = k_start + tl.arange(0, BLOCK_N)
+            q_abs_b = q_abs[:, None]
+            k_abs_b = k_abs[None, :]
+            causal_mask = k_abs_b <= q_abs_b
+            window_mask = k_abs_b >= (q_abs_b - (WINDOW_SIZE - 1))
+            sink_mask = k_abs_b < SINK_SIZE
+            full_mask = causal_mask & (window_mask | sink_mask)
+            qk = tl.where(full_mask, qk, -float('inf'))
+
+            # Numerically stable online softmax accumulation
+            m_ij = tl.max(qk, axis=1)
+            m_i_new = tl.maximum(m_i, m_ij)
+            qk_shifted_prev = tl.exp2((m_i - m_i_new) * qk_scale)
+            qk_shifted_curr = tl.exp2((qk - m_i_new[:, None]) * qk_scale)
+            l_i_new = l_i * qk_shifted_prev + tl.sum(qk_shifted_curr, axis=1)
+            acc_scale_prev = (l_i * qk_shifted_prev) / tl.where(l_i_new == 0, 1.0, l_i_new)
+            acc_scale_curr = 1.0 / tl.where(l_i_new == 0, 1.0, l_i_new)
+            v_contrib = tl.dot(qk_shifted_curr.to(v_block.dtype), v_block)
+            acc = acc * acc_scale_prev[:, None] + v_contrib * acc_scale_curr[:, None]
+            
+            # Update accumulators
+            m_i = m_i_new
+            l_i = l_i_new
+            k_start += BLOCK_N
+
+    # Phase 1 & 2: Main sliding window blocks up to current query block (causal)
+    q_block_end = q_start + BLOCK_M
+    max_k_considered = q_block_end
+    min_k_considered = q_block_end - WINDOW_SIZE
+    min_k_considered = tl.maximum(0, min_k_considered)
+    cur_k = tl.maximum(SINK_SIZE, min_k_considered)
+    
+    while cur_k < max_k_considered:
+        # Load K and V blocks
+        k_offsets = cur_k + tl.arange(0, BLOCK_N)
+        kv_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                  (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        k_block = tl.load(kv_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                  (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # Compute qk^T
+        qk = tl.dot(q_block, tl.trans(k_block)) * softmax_scale
+
+        # Apply causal + sliding-window + sink mask
+        q_abs = q_start + tl.arange(0, BLOCK_M)
+        k_abs = cur_k + tl.arange(0, BLOCK_N)
+        q_abs_b = q_abs[:, None]
+        k_abs_b = k_abs[None, :]
+        causal_mask = k_abs_b <= q_abs_b
+        window_mask = k_abs_b >= (q_abs_b - (WINDOW_SIZE - 1))
+        sink_mask = k_abs_b < SINK_SIZE
+        full_mask = causal_mask & (window_mask | sink_mask)
+        qk = tl.where(full_mask, qk, -float('inf'))
+
+        # Numerically stable online softmax accumulation
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        qk_shifted_prev = tl.exp2((m_i - m_i_new) * qk_scale)
+        qk_shifted_curr = tl.exp2((qk - m_i_new[:, None]) * qk_scale)
+        l_i_new = l_i * qk_shifted_prev + tl.sum(qk_shifted_curr, axis=1)
+        acc_scale_prev = (l_i * qk_shifted_prev) / tl.where(l_i_new == 0, 1.0, l_i_new)
+        acc_scale_curr = 1.0 / tl.where(l_i_new == 0, 1.0, l_i_new)
+        v_contrib = tl.dot(qk_shifted_curr.to(v_block.dtype), v_block)
+        acc = acc * acc_scale_prev[:, None] + v_contrib * acc_scale_curr[:, None]
+        
+        # Update accumulators
+        m_i = m_i_new
+        l_i = l_i_new
+        cur_k += BLOCK_N
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.

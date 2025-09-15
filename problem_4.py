@@ -41,6 +41,7 @@ def _flash_attention_forward_causal_kernel(
     q_ptrs = Q_ptr + batch_idx * q_stride_b + head_idx * q_stride_h + \
              (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
     q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0)
+    q_block = q_block.to(tl.float32)  # Convert to float32 for computation
     
     # PyTorch softmax is exp(x), Triton is exp2(x * log2(e)), log2(e) is approx 1.44269504
     qk_scale = softmax_scale * 1.44269504
@@ -48,24 +49,87 @@ def _flash_attention_forward_causal_kernel(
     # --- Phase 1: Accumulate in Off-Diagonal Blocks (No Masking) ---
     # Process key/value blocks that are strictly in the past (q_idx > k_idx).
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-        # Implement the logic for the off-diagonal blocks.
-        # This is very similar to the non-causal version from Problem 3.
-        # 1. Load the K and V blocks for the current iteration.
-        # 2. Compute the attention scores (S_ij).
-        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
-        pass
-        # --- END OF STUDENT IMPLEMENTATION ---
+        # Load K_j
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        k_block = k_block.to(tl.float32)
+        
+        # Compute attention scores S_ij = Q_i * K_j^T
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        
+        # Load V_j
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        v_block = v_block.to(tl.float32)
+        
+        # Online softmax update (same as non-causal case)
+        m_ij = tl.max(s_ij, 1)  # Row-wise max of current scores
+        m_new = tl.maximum(m_i, m_ij)  # Element-wise max with previous running max
+        
+        alpha = tl.exp2(m_i - m_new)  # Rescaling factor for previous values
+        beta = tl.exp2(m_ij - m_new)  # Rescaling factor for current values
+        
+        # Rescale previous accumulator and denominator
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        # Compute probabilities and update accumulator
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc += tl.dot(p_ij, v_block)
+        l_i += tl.sum(p_ij, 1)
+        
+        # Update running maximum
+        m_i = m_new
 
 
     # --- Phase 2: Run on the Diagonal Blocks (With Masking) ---
     # Process the blocks where query and key indices can overlap.
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-        # Implement the logic for the diagonal blocks, apply the causal mask to S_ij.
-        pass
-        # --- END OF STUDENT IMPLEMENTATION ---
+        # Load K_j
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        k_block = k_block.to(tl.float32)
+        
+        # Compute attention scores S_ij = Q_i * K_j^T
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        
+        # Apply causal mask: q_idx >= k_idx
+        # Create causal mask where s_ij[i, j] = -inf if q_offsets[i] < k_offsets[j]
+        causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+        s_ij = tl.where(causal_mask, s_ij, -float('inf'))
+        
+        # Load V_j
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        v_block = v_block.to(tl.float32)
+        
+        # Online softmax update with masked scores
+        m_ij = tl.max(s_ij, 1)  # Row-wise max of current scores
+        m_new = tl.maximum(m_i, m_ij)  # Element-wise max with previous running max
+        
+        alpha = tl.exp2(m_i - m_new)  # Rescaling factor for previous values
+        beta = tl.exp2(m_ij - m_new)  # Rescaling factor for current values
+        
+        # Rescale previous accumulator and denominator
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        
+        # Compute probabilities and update accumulator
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc += tl.dot(p_ij, v_block)
+        l_i += tl.sum(p_ij, 1)
+        
+        # Update running maximum
+        m_i = m_new
 
 
     # 4. Normalize and write the final output block.
